@@ -1,0 +1,9 @@
+{
+  "invoice_id": "ACME-2026-087",
+  "vendor": "Acme Supplies",
+  "invoice_date": "2026-08-17",
+  "amount": 9200.0,
+  "currency": "INR",
+  "due_date": "2026-09-10",
+  "description": "Stationery"
+}

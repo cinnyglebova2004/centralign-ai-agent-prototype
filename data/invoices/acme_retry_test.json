@@ -1,0 +1,10 @@
+
+{
+  "invoice_id": "ACME-2026-105",
+  "vendor": "Acme Supplies",
+  "invoice_date": "2026-10-09",
+  "amount": 6250.0,
+  "currency": "INR",
+  "due_date": "2026-11-09",
+  "description": "Retry mechanism test invoice"
+}

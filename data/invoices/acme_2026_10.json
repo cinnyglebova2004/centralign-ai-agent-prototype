@@ -1,0 +1,9 @@
+{
+  "invoice_id": "ACME-2026-104",
+  "vendor": "Acme Supplies",
+  "invoice_date": "2026-10-08",
+  "amount": 18450.0,
+  "currency": "INR",
+  "due_date": "2026-10-30",
+  "description": "Office and lab supplies"
+}
