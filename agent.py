@@ -79,11 +79,12 @@ class Planner:
             match = re.search(pat, request, re.IGNORECASE)
             if match:
                 value = match.group(1).strip(" .,!?:;'\"")
-                if value.lower() not in {"the", "an", "a", "latest", "this"}:
+                if value.lower() not in {"the", "an", "a", "latest", "this", "the latest", "latest invoice"}:
                     return value
         # Common natural-language phrasing: "process ACME Supplies invoice"
         match = re.search(r"\b(?:process|handle|check)\s+(.+?)\s+invoice\b", request, re.IGNORECASE)
-        return match.group(1).strip(" .,!?:;'\"") if match else ""
+        value = match.group(1).strip(" .,!?:;'\"") if match else ""
+        return "" if value.casefold() in {"the latest", "latest", "the", "this", "an", "a"} else value
 
 class AutonomousInvoiceAgent:
     def __init__(self, max_retries: int = 2):
@@ -133,6 +134,7 @@ class AutonomousInvoiceAgent:
             self._event("approval", "Approval required before writing", {"invoice_id": invoice["invoice_id"], "amount": invoice["amount"], "currency": invoice["currency"]})
             return self._finish("approval_required", f"Approval is required before writing invoice {invoice['invoice_id']} ({invoice['currency']} {invoice['amount']:,.2f}).", plan, invoice, True)
 
+        self._event("approval", "Human approval received for this invoice", {"invoice_id": invoice["invoice_id"]})
         last_error = None
         for attempt in range(1, self.max_retries + 1):
             try:

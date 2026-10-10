@@ -28,17 +28,43 @@ def _load_json(path: Path):
     except json.JSONDecodeError as exc:
         raise ToolError(f"Invalid JSON in {path.name}: {exc}")
 
+def _normalise_vendor(value: str) -> str:
+    """Normalize punctuation and whitespace for safe vendor comparisons."""
+    import re
+    return re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+
+
 def find_latest_invoice(vendor: str) -> dict[str, Any]:
-    if not vendor.strip():
+    """Find the newest invoice, preferring exact vendor matches.
+
+    A partial match is accepted only when it identifies one unique vendor name.
+    This avoids silently selecting the wrong supplier when names overlap.
+    """
+    if not vendor or not vendor.strip():
         raise ToolError("Vendor name is required.")
-    candidates = []
+    files = []
     for path in INVOICE_DIR.glob("*.json"):
         data = _load_json(path)
-        if vendor.casefold() in str(data.get("vendor", "")).casefold():
-            candidates.append((str(data.get("invoice_date", "")), data))
+        actual_vendor = str(data.get("vendor", "")).strip()
+        if actual_vendor:
+            files.append((path, data, _normalise_vendor(actual_vendor)))
+
+    requested = _normalise_vendor(vendor)
+    exact = [(path, data) for path, data, normal in files if normal == requested]
+    if exact:
+        candidates = exact
+    else:
+        partial = [(path, data, normal) for path, data, normal in files
+                   if requested in normal or normal in requested]
+        matching_vendors = {normal for _, _, normal in partial}
+        if len(matching_vendors) > 1:
+            names = sorted({str(data.get("vendor", "")) for _, data, _ in partial})
+            raise ToolError("Vendor name is ambiguous; use one of these exact names: " + ", ".join(names))
+        candidates = [(path, data) for path, data, _ in partial]
+
     if not candidates:
         raise ToolError(f"No invoice found for vendor '{vendor}'.")
-    candidates.sort(key=lambda item: item[0], reverse=True)
+    candidates.sort(key=lambda item: (str(item[1].get("invoice_date", "")), str(item[1].get("invoice_id", ""))), reverse=True)
     return candidates[0][1]
 
 def read_invoice(invoice_id: str) -> dict[str, Any]:
