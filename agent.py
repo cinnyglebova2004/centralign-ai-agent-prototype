@@ -1,283 +1,165 @@
+"""Tool-driven invoice agent with optional LLM planning and deterministic fallback."""
+from __future__ import annotations
 
-
+import json
+import os
 import re
-from datetime import datetime
+from dataclasses import dataclass, asdict
+from typing import Any, Callable
 
 from tools import (
-    find_latest_invoice,
-    read_invoice,
-    lookup_record,
-    write_record,
-    verify_record,
-    append_audit,
+    find_latest_invoice, read_invoice, lookup_record, write_record,
+    verify_record, append_audit, ToolError
 )
 
+TOOL_SCHEMAS = {
+    "find_latest_invoice": {"description": "Find the latest invoice for a vendor", "args": {"vendor": "string"}},
+    "read_invoice": {"description": "Read and validate an invoice file", "args": {"invoice_id": "string"}},
+    "lookup_record": {"description": "Check whether an invoice ID already exists in company records", "args": {"invoice_id": "string"}},
+    "write_record": {"description": "Write an approved, non-duplicate invoice record", "args": {"invoice": "object"}},
+    "verify_record": {"description": "Read a record back and compare it with the intended invoice", "args": {"invoice_id": "string", "expected": "object"}},
+}
+
+@dataclass
+class Event:
+    step: int
+    kind: str
+    message: str
+    details: dict[str, Any] | None = None
+
+@dataclass
+class RunResult:
+    status: str
+    summary: str
+    plan: list[str]
+    events: list[dict[str, Any]]
+    result: dict[str, Any] | None = None
+    approval_required: bool = False
+
+class Planner:
+    """LLM planner when OPENAI_API_KEY is present; safe deterministic fallback otherwise."""
+    def __init__(self):
+        self.api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        self.model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    def plan(self, request: str) -> dict[str, Any]:
+        if self.api_key:
+            try:
+                from openai import OpenAI
+                client = OpenAI(api_key=self.api_key)
+                response = client.chat.completions.create(
+                    model=self.model,
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content":
+                         "You plan a safe invoice-processing task. Return JSON only with keys "
+                         "'vendor' (string) and 'intent' ('process_invoice'). Do not invent invoice IDs, "
+                         "amounts, approvals, or claim actions are done. If no vendor is clear, use empty string."},
+                        {"role": "user", "content": request},
+                    ],
+                )
+                obj = json.loads(response.choices[0].message.content or "{}")
+                vendor = str(obj.get("vendor", "")).strip()
+                if vendor:
+                    return {"vendor": vendor, "source": "llm", "intent": "process_invoice"}
+            except Exception:
+                # A model/API failure must not block the bounded fallback.
+                pass
+        vendor = self._extract_vendor(request)
+        return {"vendor": vendor, "source": "rule_fallback", "intent": "process_invoice"}
+
+    @staticmethod
+    def _extract_vendor(request: str) -> str:
+        patterns = [
+            r"(?:for|from|vendor(?:\s+is)?|supplier(?:\s+is)?)\s+['\"]?([A-Za-z][A-Za-z0-9 &._-]*?)['\"]?(?:\s+invoice|\s+invoices|\s+and\b|[,.!?]|$)",
+            r"\b(?:process|handle|pay|check)\s+([A-Za-z][A-Za-z0-9 &._-]*?)\s+invoice\b",
+        ]
+        for pat in patterns:
+            match = re.search(pat, request, re.IGNORECASE)
+            if match:
+                value = match.group(1).strip(" .,!?:;'\"")
+                if value.lower() not in {"the", "an", "a", "latest", "this"}:
+                    return value
+        # Common natural-language phrasing: "process ACME Supplies invoice"
+        match = re.search(r"\b(?:process|handle|check)\s+(.+?)\s+invoice\b", request, re.IGNORECASE)
+        return match.group(1).strip(" .,!?:;'\"") if match else ""
 
 class AutonomousInvoiceAgent:
-    """A bounded invoice agent with retries, approval gates, and verification."""
+    def __init__(self, max_retries: int = 2):
+        self.planner = Planner()
+        self.max_retries = max(1, min(int(max_retries), 3))
+        self.events: list[Event] = []
+        self._step = 0
 
-    def __init__(self, fail_once=False, require_approval=True, max_retries=2):
-        self.fail_once = fail_once
-        self.require_approval = require_approval
-        self.max_retries = max_retries
-        self.trace = []
+    def _event(self, kind: str, message: str, details: dict[str, Any] | None = None):
+        self._step += 1
+        self.events.append(Event(self._step, kind, message, details))
 
-    def log(self, stage, detail):
-        self.trace.append({
-            "stage": stage,
-            "detail": detail,
-        })
-
-    def run(self, task, approved=False):
-        self.trace = []
-
-        self.log("Understand", f"Received goal: {task}")
-
-        # Step 1: Identify the vendor.
-        vendor = self._extract_vendor(task)
-
+    def run(self, request: str, approved: bool = False, simulate_failure: bool = False) -> RunResult:
+        self.events, self._step = [], 0
+        plan_obj = self.planner.plan(request)
+        vendor = plan_obj.get("vendor", "")
+        plan = [
+            "Understand request and identify vendor",
+            "Find and validate the latest matching invoice",
+            "Check for an existing record",
+            "Request approval before any new write",
+            "Write with bounded retry and verify by reading back",
+        ]
+        self._event("plan", f"Planner selected {plan_obj['source']} and identified vendor: {vendor or '(not identified)'}",
+                    {"planner": plan_obj["source"], "vendor": vendor, "available_tools": list(TOOL_SCHEMAS)})
         if not vendor:
-            msg = (
-                "I couldn't identify a vendor. Please name the supplier, "
-                "for example: 'Process the latest invoice from Acme Supplies'."
-            )
-            self.log("Clarify", msg)
+            return self._finish("needs_input", "I couldn't identify the vendor. Include a vendor name, e.g. 'Process the latest invoice for ACME Supplies'.", plan)
 
-            return {
-                "status": "needs_input",
-                "message": msg,
-                "trace": self.trace,
-            }
-
-        # Step 2: Plan the task.
-        self.log(
-            "Plan",
-            f"1) Find invoice for {vendor}; "
-            "2) read invoice; "
-            "3) check duplicates; "
-            "4) write record; "
-            "5) verify saved record.",
-        )
-
-        # Step 3: Find the invoice.
-        invoice = find_latest_invoice(vendor)
-
-        if not invoice:
-            msg = f"No invoice found for vendor '{vendor}'. No changes were made."
-            self.log("Observe", msg)
-
-            return {
-                "status": "failed",
-                "message": msg,
-                "trace": self.trace,
-            }
-
-        self.log("Execute", f"Located invoice file: {invoice['file_name']}")
-
-        # Step 4: Read and validate invoice data.
-        data = read_invoice(invoice)
-
-        required = [
-            "invoice_id",
-            "vendor",
-            "amount",
-            "currency",
-            "due_date",
-        ]
-
-        missing = [
-            key
-            for key in required
-            if key not in data or data[key] in ("", None)
-        ]
-
-        if missing:
-            msg = (
-                "Invoice is missing required fields: "
-                + ", ".join(missing)
-                + ". Nothing was written."
-            )
-            self.log("Validate", msg)
-
-            return {
-                "status": "failed",
-                "message": msg,
-                "trace": self.trace,
-            }
-
-        # Validate the amount.
         try:
-            amount = float(data["amount"])
-            if amount <= 0:
-                raise ValueError("Amount must be greater than zero.")
-        except (ValueError, TypeError):
-            msg = "Invoice amount is invalid. Nothing was written."
-            self.log("Validate", msg)
-
-            return {
-                "status": "failed",
-                "message": msg,
-                "trace": self.trace,
-            }
-
-        self.log(
-            "Observe",
-            f"Extracted invoice_id={data['invoice_id']}, "
-            f"amount={data['currency']} {amount:.2f}, "
-            f"due_date={data['due_date']}.",
-        )
-
-        # Step 5: Check for duplicates.
-        existing = lookup_record(data["invoice_id"])
+            found = find_latest_invoice(vendor)
+            self._event("tool", "find_latest_invoice completed", {"vendor": vendor, "invoice_id": found.get("invoice_id")})
+            invoice = read_invoice(found["invoice_id"])
+            self._event("observation", "Invoice fields validated", {"invoice_id": invoice["invoice_id"], "amount": invoice["amount"], "currency": invoice["currency"]})
+            existing = lookup_record(invoice["invoice_id"])
+            self._event("tool", "lookup_record completed", {"invoice_id": invoice["invoice_id"], "exists": existing is not None})
+        except (ToolError, KeyError, ValueError) as exc:
+            self._event("error", str(exc))
+            append_audit({"status": "failed", "request": request, "error": str(exc), "events": [asdict(e) for e in self.events]})
+            return self._finish("failed", f"Could not safely process invoice: {exc}", plan)
 
         if existing:
-            verified = verify_record(data["invoice_id"], existing)
+            self._event("safety", "Duplicate prevented; no write performed", {"invoice_id": invoice["invoice_id"]})
+            append_audit({"status": "duplicate", "request": request, "invoice_id": invoice["invoice_id"], "events": [asdict(e) for e in self.events]})
+            return self._finish("duplicate", f"Invoice {invoice['invoice_id']} already exists. No duplicate record was created.", plan, existing)
 
-            msg = (
-                "This invoice is already recorded. "
-                "The existing record was checked; no duplicate was created."
-            )
+        if not approved:
+            self._event("approval", "Approval required before writing", {"invoice_id": invoice["invoice_id"], "amount": invoice["amount"], "currency": invoice["currency"]})
+            return self._finish("approval_required", f"Approval is required before writing invoice {invoice['invoice_id']} ({invoice['currency']} {invoice['amount']:,.2f}).", plan, invoice, True)
 
-            self.log("Verify", "Duplicate detected; existing record checked.")
-
-            return {
-                "status": "completed" if verified else "failed",
-                "message": msg,
-                "trace": self.trace,
-                "record": existing,
-                "verification": verified,
-            }
-
-        # Step 6: Ask for approval before making a change.
-        if self.require_approval and not approved:
-            msg = "Approval is required before writing to the internal system."
-            self.log("Approval", msg)
-
-            return {
-                "status": "needs_approval",
-                "message": msg,
-                "trace": self.trace,
-                "record": data,
-            }
-
-        # Step 7: Prepare the record.
-        payload = {
-            "invoice_id": data["invoice_id"],
-            "vendor": data["vendor"],
-            "amount": amount,
-            "currency": data["currency"],
-            "due_date": data["due_date"],
-            "source_file": invoice["file_name"],
-            "created_at": datetime.now().isoformat(timespec="seconds"),
-        }
-
-        # Step 8: Write with bounded retries.
-        attempts = 0
-        write_succeeded = False
-
-        while attempts <= self.max_retries:
-            attempts += 1
-
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
             try:
-                if self.fail_once:
-                    self.fail_once = False
-                    raise RuntimeError(
-                        "Simulated temporary write failure"
-                    )
-
-                write_record(payload)
-                write_succeeded = True
-
-                self.log(
-                    "Execute",
-                    f"Write succeeded on attempt {attempts}.",
-                )
+                self._event("action", f"Write attempt {attempt} started", {"attempt": attempt})
+                write_record(invoice, simulate_failure=(simulate_failure and attempt == 1))
+                self._event("observation", f"Write attempt {attempt} succeeded", {"attempt": attempt})
+                last_error = None
                 break
+            except ToolError as exc:
+                last_error = str(exc)
+                self._event("retry" if attempt < self.max_retries else "error",
+                            f"Write attempt {attempt} failed: {exc}",
+                            {"attempt": attempt, "will_retry": attempt < self.max_retries})
+        if last_error:
+            append_audit({"status": "failed", "request": request, "invoice_id": invoice["invoice_id"], "error": last_error, "events": [asdict(e) for e in self.events]})
+            return self._finish("failed", f"Write failed after {self.max_retries} attempt(s): {last_error}", plan, invoice)
 
-            except Exception as exc:
-                self.log(
-                    "Recover",
-                    f"Attempt {attempts} failed: {exc}",
-                )
+        try:
+            verified = verify_record(invoice["invoice_id"], invoice)
+            self._event("verification", "Read-after-write verification passed", {"invoice_id": invoice["invoice_id"], "verified": True})
+        except ToolError as exc:
+            self._event("error", f"Verification failed: {exc}")
+            append_audit({"status": "verification_failed", "request": request, "invoice_id": invoice["invoice_id"], "error": str(exc), "events": [asdict(e) for e in self.events]})
+            return self._finish("verification_failed", f"The write may have occurred, but verification failed: {exc}", plan, invoice)
 
-                if attempts > self.max_retries:
-                    msg = (
-                        f"Write failed after {attempts} attempts. "
-                        "The agent stopped without claiming success."
-                    )
+        append_audit({"status": "completed", "request": request, "invoice_id": invoice["invoice_id"], "events": [asdict(e) for e in self.events]})
+        return self._finish("completed", f"Invoice {invoice['invoice_id']} was saved and verified successfully.", plan, verified)
 
-                    append_audit({
-                        "task": task,
-                        "status": "failed",
-                        "trace": self.trace,
-                        "invoice_id": data["invoice_id"],
-                    })
-
-                    return {
-                        "status": "failed",
-                        "message": msg,
-                        "trace": self.trace,
-                    }
-
-        if not write_succeeded:
-            return {
-                "status": "failed",
-                "message": "The invoice could not be written.",
-                "trace": self.trace,
-            }
-
-        # Step 9: Read the saved record and verify it.
-        saved_record = lookup_record(data["invoice_id"])
-
-        verified = (
-            saved_record is not None
-            and verify_record(data["invoice_id"], payload)
-        )
-
-        self.log(
-            "Verify",
-            "Read-after-write verification: "
-            + ("passed." if verified else "failed."),
-        )
-
-        status = "completed" if verified else "failed"
-
-        if verified:
-            msg = "Invoice recorded and verified."
-        else:
-            msg = (
-                "A record may have been written, but verification failed. "
-                "Please inspect the internal system."
-            )
-
-        # Step 10: Record the audit trail.
-        audit_file = append_audit({
-            "task": task,
-            "status": status,
-            "trace": self.trace,
-            "invoice_id": data["invoice_id"],
-        })
-
-        return {
-            "status": status,
-            "message": msg,
-            "trace": self.trace,
-            "record": saved_record,
-            "verification": verified,
-            "audit_file": audit_file,
-        }
-
-    def _extract_vendor(self, task):
-        patterns = [
-            r"invoice\s+from\s+(.+?)(?:,|\.|;|$)",
-            r"vendor\s+(.+?)(?:,|\.|;|$)",
-            r"from\s+(.+?)(?:,|\.|;|$)",
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, task, flags=re.IGNORECASE)
-
-            if match:
-                return match.group(1).strip().strip("'\"")
-
-        return None
+    def _finish(self, status, summary, plan, result=None, approval_required=False):
+        return RunResult(status, summary, plan, [asdict(e) for e in self.events], result, approval_required)
